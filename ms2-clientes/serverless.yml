@@ -1,0 +1,82 @@
+# MS2 · Clientes (P2). RDS PostgreSQL, base clientes_db, un schema por tenant.
+service: crm-ms2-clientes
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.12
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
+  environment:
+    DB_HOST: ${cf:crm-rds-${sls:stage}.DbHost}
+    DB_NOMBRE: clientes_db
+    DB_USUARIO: crm_admin
+    DB_CLAVE: ${env:CRM_DB_PASSWORD}
+    TOPICO_EVENTOS: ${cf:crm-compartido-${sls:stage}.TopicoEventosArn}
+  httpApi:
+    cors: true
+    authorizers:
+      tokenCrm:
+        type: request
+        functionArn: ${self:custom.autorizadorArn}
+        identitySource: $request.header.Authorization
+        enableSimpleResponses: true
+        payloadVersion: '2.0'
+        resultTtlInSeconds: 300
+
+custom:
+  autorizadorArn: ${cf:crm-ms1-usuarios-${sls:stage}.AutorizadorArn}
+  pythonRequirements:
+    dockerizePip: false   # pg8000 es Python puro: no hace falta Docker en Windows
+
+plugins:
+  - serverless-python-requirements
+
+package:
+  patterns:
+    - '!tests/**'
+    - '!**/__pycache__/**'
+    - '!node_modules/**'
+
+functions:
+  api:
+    handler: src/handler.main
+    events:
+      - httpApi: { method: GET, path: /ms2/health }
+      - httpApi: { method: GET, path: /ms2/cuentas, authorizer: { name: tokenCrm } }
+      - httpApi: { method: GET, path: '/ms2/cuentas/{id}', authorizer: { name: tokenCrm } }
+      - httpApi: { method: POST, path: /ms2/cuentas, authorizer: { name: tokenCrm } }
+      - httpApi: { method: POST, path: '/ms2/cuentas/{id}/contactos', authorizer: { name: tokenCrm } }
+      - httpApi: { method: PATCH, path: '/ms2/contactos/{id}', authorizer: { name: tokenCrm } }
+
+  consumidor:
+    handler: src/handler.consumidor
+    events:
+      - sqs:
+          arn: ${cf:crm-compartido-${sls:stage}.ColaMs2Arn}
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    # El Authorizer vive en MS1: hay que permitir que ESTA API lo invoque.
+    PermisoAutorizador:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: ${self:custom.autorizadorArn}
+        Principal: apigateway.amazonaws.com
+        SourceArn:
+          Fn::Join:
+            - ''
+            - - 'arn:aws:execute-api:'
+              - { Ref: AWS::Region }
+              - ':'
+              - { Ref: AWS::AccountId }
+              - ':'
+              - { Ref: HttpApi }
+              - '/authorizers/*'
